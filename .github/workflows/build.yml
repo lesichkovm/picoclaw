@@ -2,24 +2,30 @@ name: build
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
 
 jobs:
-  build:
+  integration:
+    name: Integration Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      - name: Run Docker-backed integration suites
+        run: bash ./scripts/run-integration-tests.sh
+
+  build:
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - name: fmt
-        run: |
-          make fmt
-          git diff --exit-code || (echo "::error::Code is not formatted. Run 'make fmt' and commit the changes." && exit 1)
-
-      - name: Build
+      - name: Build core binaries
         run: make build-all

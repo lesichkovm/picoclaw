@@ -3,11 +3,25 @@ package auth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+func makeJWTForClaims(t *testing.T, claims map[string]any) string {
+	t.Helper()
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadJSON, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+	return header + "." + payload + ".sig"
+}
 
 func TestBuildAuthorizeURL(t *testing.T) {
 	cfg := OAuthProviderConfig{
@@ -53,8 +67,30 @@ func TestBuildAuthorizeURL(t *testing.T) {
 	}
 }
 
+func TestBuildAuthorizeURLOpenAIExtras(t *testing.T) {
+	cfg := OpenAIOAuthConfig()
+	pkce := PKCECodes{CodeVerifier: "test-verifier", CodeChallenge: "test-challenge"}
+
+	u := BuildAuthorizeURL(cfg, pkce, "test-state", "http://localhost:1455/auth/callback")
+	parsed, err := url.Parse(u)
+	if err != nil {
+		t.Fatalf("url.Parse() error: %v", err)
+	}
+	q := parsed.Query()
+
+	if q.Get("id_token_add_organizations") != "true" {
+		t.Errorf("id_token_add_organizations = %q, want true", q.Get("id_token_add_organizations"))
+	}
+	if q.Get("codex_cli_simplified_flow") != "true" {
+		t.Errorf("codex_cli_simplified_flow = %q, want true", q.Get("codex_cli_simplified_flow"))
+	}
+	if q.Get("originator") != "codex_cli_rs" {
+		t.Errorf("originator = %q, want codex_cli_rs", q.Get("originator"))
+	}
+}
+
 func TestParseTokenResponse(t *testing.T) {
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"access_token":  "test-access-token",
 		"refresh_token": "test-refresh-token",
 		"expires_in":    3600,
@@ -84,6 +120,37 @@ func TestParseTokenResponse(t *testing.T) {
 	}
 }
 
+func TestParseTokenResponseExtractsAccountIDFromIDToken(t *testing.T) {
+	idToken := makeJWTForClaims(t, map[string]any{"chatgpt_account_id": "acc-id-from-id-token"})
+	resp := map[string]any{
+		"access_token":  "opaque-access-token",
+		"refresh_token": "test-refresh-token",
+		"expires_in":    3600,
+		"id_token":      idToken,
+	}
+	body, _ := json.Marshal(resp)
+
+	cred, err := parseTokenResponse(body, "openai")
+	if err != nil {
+		t.Fatalf("parseTokenResponse() error: %v", err)
+	}
+	if cred.AccountID != "acc-id-from-id-token" {
+		t.Errorf("AccountID = %q, want %q", cred.AccountID, "acc-id-from-id-token")
+	}
+}
+
+func TestExtractAccountIDFromOrganizationsFallback(t *testing.T) {
+	token := makeJWTForClaims(t, map[string]any{
+		"organizations": []any{
+			map[string]any{"id": "org_from_orgs"},
+		},
+	})
+
+	if got := extractAccountID(token); got != "org_from_orgs" {
+		t.Errorf("extractAccountID() = %q, want %q", got, "org_from_orgs")
+	}
+}
+
 func TestParseTokenResponseNoAccessToken(t *testing.T) {
 	body := []byte(`{"refresh_token": "test"}`)
 	_, err := parseTokenResponse(body, "openai")
@@ -94,7 +161,7 @@ func TestParseTokenResponseNoAccessToken(t *testing.T) {
 
 func TestParseTokenResponseAccountIDFromIDToken(t *testing.T) {
 	idToken := makeJWTWithAccountID("acc-from-id")
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"access_token":  "not-a-jwt",
 		"refresh_token": "test-refresh-token",
 		"expires_in":    3600,
@@ -114,7 +181,9 @@ func TestParseTokenResponseAccountIDFromIDToken(t *testing.T) {
 
 func makeJWTWithAccountID(accountID string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"` + accountID + `"}}`))
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"https://api.openai.com/auth":{"chatgpt_account_id":"` + accountID + `"}}`),
+	)
 	return header + "." + payload + ".sig"
 }
 
@@ -135,7 +204,7 @@ func TestExchangeCodeForTokens(t *testing.T) {
 			return
 		}
 
-		resp := map[string]interface{}{
+		resp := map[string]any{
 			"access_token":  "mock-access-token",
 			"refresh_token": "mock-refresh-token",
 			"expires_in":    3600,
@@ -151,9 +220,9 @@ func TestExchangeCodeForTokens(t *testing.T) {
 		Port:     1455,
 	}
 
-	cred, err := exchangeCodeForTokens(cfg, "test-code", "test-verifier", "http://localhost:1455/auth/callback")
+	cred, err := ExchangeCodeForTokens(cfg, "test-code", "test-verifier", "http://localhost:1455/auth/callback")
 	if err != nil {
-		t.Fatalf("exchangeCodeForTokens() error: %v", err)
+		t.Fatalf("ExchangeCodeForTokens() error: %v", err)
 	}
 
 	if cred.AccessToken != "mock-access-token" {
@@ -174,7 +243,7 @@ func TestRefreshAccessToken(t *testing.T) {
 			return
 		}
 
-		resp := map[string]interface{}{
+		resp := map[string]any{
 			"access_token":  "refreshed-access-token",
 			"refresh_token": "refreshed-refresh-token",
 			"expires_in":    3600,
@@ -219,6 +288,37 @@ func TestRefreshAccessTokenNoRefreshToken(t *testing.T) {
 	_, err := RefreshAccessToken(cred, cfg)
 	if err == nil {
 		t.Error("expected error for missing refresh token")
+	}
+}
+
+func TestRefreshAccessTokenPreservesRefreshAndAccountID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"access_token": "new-access-token-only",
+			"expires_in":   3600,
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := OAuthProviderConfig{Issuer: server.URL, ClientID: "test-client"}
+	cred := &AuthCredential{
+		AccessToken:  "old-access",
+		RefreshToken: "existing-refresh",
+		AccountID:    "acc_existing",
+		Provider:     "openai",
+		AuthMethod:   "oauth",
+	}
+
+	refreshed, err := RefreshAccessToken(cred, cfg)
+	if err != nil {
+		t.Fatalf("RefreshAccessToken() error: %v", err)
+	}
+	if refreshed.RefreshToken != "existing-refresh" {
+		t.Errorf("RefreshToken = %q, want %q", refreshed.RefreshToken, "existing-refresh")
+	}
+	if refreshed.AccountID != "acc_existing" {
+		t.Errorf("AccountID = %q, want %q", refreshed.AccountID, "acc_existing")
 	}
 }
 
@@ -273,4 +373,119 @@ func TestParseDeviceCodeResponseInvalidInterval(t *testing.T) {
 	if _, err := parseDeviceCodeResponse(body); err == nil {
 		t.Fatal("expected error for invalid interval")
 	}
+}
+
+func TestLoginBrowserWithOptionsNoBrowserDoesNotRequireCallbackPort(t *testing.T) {
+	server := newMockOAuthTokenServer()
+	defer server.Close()
+	reservedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error: %v", err)
+	}
+	defer reservedListener.Close()
+
+	reservedPort := reservedListener.Addr().(*net.TCPAddr).Port
+	origOpenBrowserFunc := openBrowserFunc
+	origBrowserLoginInput := browserLoginInput
+	t.Cleanup(func() {
+		openBrowserFunc = origOpenBrowserFunc
+		browserLoginInput = origBrowserLoginInput
+	})
+
+	var openCalls int
+	openBrowserFunc = func(string) error {
+		openCalls++
+		return nil
+	}
+	browserLoginInput = strings.NewReader("manual-code\n")
+
+	cfg := OAuthProviderConfig{
+		Issuer:   server.URL,
+		ClientID: "test-client",
+		Scopes:   "openid",
+		Port:     reservedPort,
+	}
+
+	cred, err := LoginBrowserWithOptions(cfg, LoginBrowserOptions{NoBrowser: true})
+	if err != nil {
+		t.Fatalf("LoginBrowserWithOptions() error: %v", err)
+	}
+
+	if openCalls != 0 {
+		t.Fatalf("openBrowserFunc call count = %d, want 0", openCalls)
+	}
+	if cred.AccessToken != "mock-access-token" {
+		t.Fatalf("AccessToken = %q, want %q", cred.AccessToken, "mock-access-token")
+	}
+}
+
+func TestLoginBrowserWithOptionsAutoOpensByDefault(t *testing.T) {
+	server := newMockOAuthTokenServer()
+	defer server.Close()
+
+	origOpenBrowserFunc := openBrowserFunc
+	origBrowserLoginInput := browserLoginInput
+	t.Cleanup(func() {
+		openBrowserFunc = origOpenBrowserFunc
+		browserLoginInput = origBrowserLoginInput
+	})
+
+	var (
+		openCalls  int
+		browserURL string
+	)
+	openBrowserFunc = func(url string) error {
+		openCalls++
+		browserURL = url
+		return nil
+	}
+	browserLoginInput = strings.NewReader("manual-code\n")
+
+	cfg := OAuthProviderConfig{
+		Issuer:   server.URL,
+		ClientID: "test-client",
+		Scopes:   "openid",
+		Port:     0,
+	}
+
+	_, err := LoginBrowserWithOptions(cfg, LoginBrowserOptions{})
+	if err != nil {
+		t.Fatalf("LoginBrowserWithOptions() error: %v", err)
+	}
+
+	if openCalls != 1 {
+		t.Fatalf("openBrowserFunc call count = %d, want 1", openCalls)
+	}
+
+	parsedBrowserURL, err := url.Parse(browserURL)
+	if err != nil {
+		t.Fatalf("url.Parse(browserURL) error: %v", err)
+	}
+
+	redirectURI, err := url.Parse(parsedBrowserURL.Query().Get("redirect_uri"))
+	if err != nil {
+		t.Fatalf("url.Parse(redirectURI) error: %v", err)
+	}
+	if redirectURI.Port() == "" {
+		t.Fatal("redirectURI port is empty")
+	}
+	if redirectURI.Port() == "0" {
+		t.Fatalf("redirectURI port = %q, want dynamically assigned port", redirectURI.Port())
+	}
+}
+
+func newMockOAuthTokenServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/token" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		resp := map[string]any{
+			"access_token":  "mock-access-token",
+			"refresh_token": "mock-refresh-token",
+			"expires_in":    3600,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
 }

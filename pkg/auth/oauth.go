@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -19,12 +21,23 @@ import (
 )
 
 type OAuthProviderConfig struct {
-	Issuer     string
-	ClientID   string
-	Scopes     string
-	Originator string
-	Port       int
+	Issuer       string
+	ClientID     string
+	ClientSecret string // Required for Google OAuth (confidential client)
+	TokenURL     string // Override token endpoint (Google uses a different URL than issuer)
+	Scopes       string
+	Originator   string
+	Port         int
 }
+
+type LoginBrowserOptions struct {
+	NoBrowser bool
+}
+
+var (
+	openBrowserFunc             = OpenBrowser
+	browserLoginInput io.Reader = os.Stdin
+)
 
 func OpenAIOAuthConfig() OAuthProviderConfig {
 	return OAuthProviderConfig{
@@ -36,7 +49,34 @@ func OpenAIOAuthConfig() OAuthProviderConfig {
 	}
 }
 
-func generateState() (string, error) {
+// GoogleAntigravityOAuthConfig returns the OAuth configuration for Google Cloud Code Assist (Antigravity).
+// Client credentials are the same ones used by OpenCode/pi-ai for Cloud Code Assist access.
+func GoogleAntigravityOAuthConfig() OAuthProviderConfig {
+	// These are the same client credentials used by the OpenCode antigravity plugin.
+	clientID := decodeBase64(
+		"MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
+	)
+	clientSecret := decodeBase64("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=")
+	return OAuthProviderConfig{
+		Issuer:       "https://accounts.google.com/o/oauth2/v2",
+		TokenURL:     "https://oauth2.googleapis.com/token",
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Scopes:       "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs",
+		Port:         51121,
+	}
+}
+
+func decodeBase64(s string) string {
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return s
+	}
+	return string(data)
+}
+
+// GenerateState generates a random state string for OAuth CSRF protection.
+func GenerateState() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -45,22 +85,110 @@ func generateState() (string, error) {
 }
 
 func LoginBrowser(cfg OAuthProviderConfig) (*AuthCredential, error) {
+	return LoginBrowserWithOptions(cfg, LoginBrowserOptions{})
+}
+
+func LoginBrowserWithOptions(cfg OAuthProviderConfig, opts LoginBrowserOptions) (*AuthCredential, error) {
 	pkce, err := GeneratePKCE()
 	if err != nil {
 		return nil, fmt.Errorf("generating PKCE: %w", err)
 	}
 
-	state, err := generateState()
+	state, err := GenerateState()
 	if err != nil {
 		return nil, fmt.Errorf("generating state: %w", err)
 	}
 
-	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", cfg.Port)
+	redirectURI := oauthCallbackRedirectURI(cfg.Port)
+	callbackPort := cfg.Port
+	var resultCh <-chan callbackResult
+
+	if !opts.NoBrowser {
+		callbackResultCh := make(chan callbackResult, 1)
+		listener, actualPort, err := listenOAuthCallback(cfg.Port)
+		if err != nil {
+			return nil, fmt.Errorf("starting callback server on port %d: %w", cfg.Port, err)
+		}
+
+		redirectURI = oauthCallbackRedirectURI(actualPort)
+		callbackPort = actualPort
+		resultCh = callbackResultCh
+
+		server := &http.Server{Handler: oauthCallbackHandler(state, callbackResultCh)}
+		go func() {
+			_ = server.Serve(listener)
+		}()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = server.Shutdown(ctx)
+		}()
+	}
 
 	authURL := buildAuthorizeURL(cfg, pkce, state, redirectURI)
 
-	resultCh := make(chan callbackResult, 1)
+	fmt.Printf("Open this URL to authenticate:\n\n%s\n\n", authURL)
 
+	if opts.NoBrowser {
+		fmt.Println("Browser auto-open disabled. Open the URL manually to continue.")
+	} else if err := openBrowserFunc(authURL); err != nil {
+		fmt.Printf("Could not open browser automatically.\nPlease open this URL manually:\n\n%s\n\n", authURL)
+	}
+
+	fmt.Printf(
+		"Wait! If you are in a headless environment (like Coolify/VPS) and cannot reach localhost:%d,\n",
+		callbackPort,
+	)
+	fmt.Println(
+		"please complete the login in your local browser and then PASTE the final redirect URL (or just the code) here.",
+	)
+	fmt.Println("Waiting for authentication (browser or manual paste)...")
+
+	// Start manual input in a goroutine
+	manualCh := make(chan string, 1)
+	manualDone := make(chan struct{})
+	defer close(manualDone)
+	go func() {
+		reader := bufio.NewReader(browserLoginInput)
+		input, _ := reader.ReadString('\n')
+		select {
+		case manualCh <- strings.TrimSpace(input):
+		case <-manualDone:
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, result.err
+		}
+		return ExchangeCodeForTokens(cfg, result.code, pkce.CodeVerifier, redirectURI)
+	case manualInput := <-manualCh:
+		if manualInput == "" {
+			return nil, fmt.Errorf("manual input canceled")
+		}
+		// Extract code from URL if it's a full URL
+		code := manualInput
+		if strings.Contains(manualInput, "?") {
+			u, err := url.Parse(manualInput)
+			if err == nil {
+				code = u.Query().Get("code")
+			}
+		}
+		if code == "" {
+			return nil, fmt.Errorf("could not find authorization code in input")
+		}
+		return ExchangeCodeForTokens(cfg, code, pkce.CodeVerifier, redirectURI)
+	case <-time.After(5 * time.Minute):
+		return nil, fmt.Errorf("authentication timed out after 5 minutes")
+	}
+}
+
+func oauthCallbackRedirectURI(port int) string {
+	return fmt.Sprintf("http://localhost:%d/auth/callback", port)
+}
+
+func oauthCallbackHandler(state string, resultCh chan<- callbackResult) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != state {
@@ -81,38 +209,22 @@ func LoginBrowser(cfg OAuthProviderConfig) (*AuthCredential, error) {
 		fmt.Fprint(w, "<html><body><h2>Authentication successful!</h2><p>You can close this window.</p></body></html>")
 		resultCh <- callbackResult{code: code}
 	})
+	return mux
+}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.Port))
+func listenOAuthCallback(port int) (net.Listener, int, error) {
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
-		return nil, fmt.Errorf("starting callback server on port %d: %w", cfg.Port, err)
+		return nil, 0, err
 	}
 
-	server := &http.Server{Handler: mux}
-	go server.Serve(listener)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-	}()
-
-	fmt.Printf("Open this URL to authenticate:\n\n%s\n\n", authURL)
-
-	if err := openBrowser(authURL); err != nil {
-		fmt.Printf("Could not open browser automatically.\nPlease open this URL manually:\n\n%s\n\n", authURL)
+	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = listener.Close()
+		return nil, 0, fmt.Errorf("unexpected listener address type %T", listener.Addr())
 	}
 
-	fmt.Println("If you're running in a headless environment, use: picoclaw auth login --provider openai --device-code")
-	fmt.Println("Waiting for authentication in browser...")
-
-	select {
-	case result := <-resultCh:
-		if result.err != nil {
-			return nil, result.err
-		}
-		return exchangeCodeForTokens(cfg, result.code, pkce.CodeVerifier, redirectURI)
-	case <-time.After(5 * time.Minute):
-		return nil, fmt.Errorf("authentication timed out after 5 minutes")
-	}
+	return listener, tcpAddr.Port, nil
 }
 
 type callbackResult struct {
@@ -124,6 +236,62 @@ type deviceCodeResponse struct {
 	DeviceAuthID string
 	UserCode     string
 	Interval     int
+}
+
+// DeviceCodeInfo holds the device code information returned by the OAuth provider.
+type DeviceCodeInfo struct {
+	DeviceAuthID string `json:"device_auth_id"`
+	UserCode     string `json:"user_code"`
+	VerifyURL    string `json:"verify_url"`
+	Interval     int    `json:"interval"`
+}
+
+// RequestDeviceCode requests a device code from the OAuth provider.
+// Returns the info needed for the user to authenticate in a browser.
+func RequestDeviceCode(cfg OAuthProviderConfig) (*DeviceCodeInfo, error) {
+	reqBody, _ := json.Marshal(map[string]string{
+		"client_id": cfg.ClientID,
+	})
+
+	resp, err := http.Post(
+		cfg.Issuer+"/api/accounts/deviceauth/usercode",
+		"application/json",
+		strings.NewReader(string(reqBody)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("requesting device code: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading device code response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("device code request failed: %s", string(body))
+	}
+
+	deviceResp, err := parseDeviceCodeResponse(body)
+	if err != nil {
+		return nil, fmt.Errorf("parsing device code response: %w", err)
+	}
+
+	if deviceResp.Interval < 1 {
+		deviceResp.Interval = 5
+	}
+
+	return &DeviceCodeInfo{
+		DeviceAuthID: deviceResp.DeviceAuthID,
+		UserCode:     deviceResp.UserCode,
+		VerifyURL:    cfg.Issuer + "/codex/device",
+		Interval:     deviceResp.Interval,
+	}, nil
+}
+
+// PollDeviceCodeOnce makes a single poll attempt to check if the user has authenticated.
+// Returns (credential, nil) on success, (nil, nil) if still pending, or (nil, err) on failure.
+func PollDeviceCodeOnce(cfg OAuthProviderConfig, deviceAuthID, userCode string) (*AuthCredential, error) {
+	return pollDeviceCode(cfg, deviceAuthID, userCode)
 }
 
 func parseDeviceCodeResponse(body []byte) (deviceCodeResponse, error) {
@@ -186,7 +354,10 @@ func LoginDeviceCode(cfg OAuthProviderConfig) (*AuthCredential, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading device code response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("device code request failed: %s", string(body))
 	}
@@ -200,8 +371,11 @@ func LoginDeviceCode(cfg OAuthProviderConfig) (*AuthCredential, error) {
 		deviceResp.Interval = 5
 	}
 
-	fmt.Printf("\nTo authenticate, open this URL in your browser:\n\n  %s/codex/device\n\nThen enter this code: %s\n\nWaiting for authentication...\n",
-		cfg.Issuer, deviceResp.UserCode)
+	fmt.Printf(
+		"\nTo authenticate, open this URL in your browser:\n\n  %s/codex/device\n\nThen enter this code: %s\n\nWaiting for authentication...\n",
+		cfg.Issuer,
+		deviceResp.UserCode,
+	)
 
 	deadline := time.After(15 * time.Minute)
 	ticker := time.NewTicker(time.Duration(deviceResp.Interval) * time.Second)
@@ -243,7 +417,10 @@ func pollDeviceCode(cfg OAuthProviderConfig, deviceAuthID, userCode string) (*Au
 		return nil, fmt.Errorf("pending")
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading device token response: %w", err)
+	}
 
 	var tokenResp struct {
 		AuthorizationCode string `json:"authorization_code"`
@@ -255,7 +432,7 @@ func pollDeviceCode(cfg OAuthProviderConfig, deviceAuthID, userCode string) (*Au
 	}
 
 	redirectURI := cfg.Issuer + "/deviceauth/callback"
-	return exchangeCodeForTokens(cfg, tokenResp.AuthorizationCode, tokenResp.CodeVerifier, redirectURI)
+	return ExchangeCodeForTokens(cfg, tokenResp.AuthorizationCode, tokenResp.CodeVerifier, redirectURI)
 }
 
 func RefreshAccessToken(cred *AuthCredential, cfg OAuthProviderConfig) (*AuthCredential, error) {
@@ -269,19 +446,46 @@ func RefreshAccessToken(cred *AuthCredential, cfg OAuthProviderConfig) (*AuthCre
 		"refresh_token": {cred.RefreshToken},
 		"scope":         {"openid profile email"},
 	}
+	if cfg.ClientSecret != "" {
+		data.Set("client_secret", cfg.ClientSecret)
+	}
 
-	resp, err := http.PostForm(cfg.Issuer+"/oauth/token", data)
+	tokenURL := cfg.Issuer + "/oauth/token"
+	if cfg.TokenURL != "" {
+		tokenURL = cfg.TokenURL
+	}
+
+	resp, err := http.PostForm(tokenURL, data)
 	if err != nil {
 		return nil, fmt.Errorf("refreshing token: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading token refresh response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token refresh failed: %s", string(body))
 	}
 
-	return parseTokenResponse(body, cred.Provider)
+	refreshed, err := parseTokenResponse(body, cred.Provider)
+	if err != nil {
+		return nil, err
+	}
+	if refreshed.RefreshToken == "" {
+		refreshed.RefreshToken = cred.RefreshToken
+	}
+	if refreshed.AccountID == "" {
+		refreshed.AccountID = cred.AccountID
+	}
+	if cred.Email != "" && refreshed.Email == "" {
+		refreshed.Email = cred.Email
+	}
+	if cred.ProjectID != "" && refreshed.ProjectID == "" {
+		refreshed.ProjectID = cred.ProjectID
+	}
+	return refreshed, nil
 }
 
 func BuildAuthorizeURL(cfg OAuthProviderConfig, pkce PKCECodes, state, redirectURI string) string {
@@ -290,23 +494,41 @@ func BuildAuthorizeURL(cfg OAuthProviderConfig, pkce PKCECodes, state, redirectU
 
 func buildAuthorizeURL(cfg OAuthProviderConfig, pkce PKCECodes, state, redirectURI string) string {
 	params := url.Values{
-		"response_type":              {"code"},
-		"client_id":                  {cfg.ClientID},
-		"redirect_uri":               {redirectURI},
-		"scope":                      {cfg.Scopes},
-		"code_challenge":             {pkce.CodeChallenge},
-		"code_challenge_method":      {"S256"},
-		"id_token_add_organizations": {"true"},
-		"codex_cli_simplified_flow":  {"true"},
-		"state":                      {state},
+		"response_type":         {"code"},
+		"client_id":             {cfg.ClientID},
+		"redirect_uri":          {redirectURI},
+		"scope":                 {cfg.Scopes},
+		"code_challenge":        {pkce.CodeChallenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {state},
 	}
-	if cfg.Originator != "" {
-		params.Set("originator", cfg.Originator)
+
+	isGoogle := strings.Contains(strings.ToLower(cfg.Issuer), "accounts.google.com")
+	if isGoogle {
+		// Google OAuth requires these for refresh token support
+		params.Set("access_type", "offline")
+		params.Set("prompt", "consent")
+	} else {
+		// OpenAI-specific parameters
+		params.Set("id_token_add_organizations", "true")
+		params.Set("codex_cli_simplified_flow", "true")
+		if strings.Contains(strings.ToLower(cfg.Issuer), "auth.openai.com") {
+			params.Set("originator", "picoclaw")
+		}
+		if cfg.Originator != "" {
+			params.Set("originator", cfg.Originator)
+		}
+	}
+
+	// Google uses /auth path, OpenAI uses /oauth/authorize
+	if isGoogle {
+		return cfg.Issuer + "/auth?" + params.Encode()
 	}
 	return cfg.Issuer + "/oauth/authorize?" + params.Encode()
 }
 
-func exchangeCodeForTokens(cfg OAuthProviderConfig, code, codeVerifier, redirectURI string) (*AuthCredential, error) {
+// ExchangeCodeForTokens exchanges an authorization code for tokens.
+func ExchangeCodeForTokens(cfg OAuthProviderConfig, code, codeVerifier, redirectURI string) (*AuthCredential, error) {
 	data := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -314,19 +536,36 @@ func exchangeCodeForTokens(cfg OAuthProviderConfig, code, codeVerifier, redirect
 		"client_id":     {cfg.ClientID},
 		"code_verifier": {codeVerifier},
 	}
+	if cfg.ClientSecret != "" {
+		data.Set("client_secret", cfg.ClientSecret)
+	}
 
-	resp, err := http.PostForm(cfg.Issuer+"/oauth/token", data)
+	tokenURL := cfg.Issuer + "/oauth/token"
+	if cfg.TokenURL != "" {
+		tokenURL = cfg.TokenURL
+	}
+
+	// Determine provider name from config
+	provider := "openai"
+	if cfg.TokenURL != "" && strings.Contains(cfg.TokenURL, "googleapis.com") {
+		provider = "google-antigravity"
+	}
+
+	resp, err := http.PostForm(tokenURL, data)
 	if err != nil {
 		return nil, fmt.Errorf("exchanging code for tokens: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading token exchange response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token exchange failed: %s", string(body))
 	}
 
-	return parseTokenResponse(body, "openai")
+	return parseTokenResponse(body, provider)
 }
 
 func parseTokenResponse(body []byte, provider string) (*AuthCredential, error) {
@@ -357,20 +596,53 @@ func parseTokenResponse(body []byte, provider string) (*AuthCredential, error) {
 		AuthMethod:   "oauth",
 	}
 
-	if accountID := extractAccountID(tokenResp.AccessToken); accountID != "" {
-		cred.AccountID = accountID
-	} else if accountID := extractAccountID(tokenResp.IDToken); accountID != "" {
-		// Recent OpenAI OAuth responses may only include chatgpt_account_id in id_token claims.
-		cred.AccountID = accountID
+	// Recent OpenAI OAuth responses may only include chatgpt_account_id in id_token claims.
+	if id := extractAccountID(tokenResp.IDToken); id != "" {
+		cred.AccountID = id
+	} else if id := extractAccountID(tokenResp.AccessToken); id != "" {
+		cred.AccountID = id
 	}
 
 	return cred, nil
 }
 
-func extractAccountID(accessToken string) string {
-	parts := strings.Split(accessToken, ".")
-	if len(parts) < 2 {
+func extractAccountID(token string) string {
+	claims, err := parseJWTClaims(token)
+	if err != nil {
 		return ""
+	}
+
+	if accountID, ok := claims["chatgpt_account_id"].(string); ok && accountID != "" {
+		return accountID
+	}
+
+	if accountID, ok := claims["https://api.openai.com/auth.chatgpt_account_id"].(string); ok && accountID != "" {
+		return accountID
+	}
+
+	if authClaim, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		if accountID, ok := authClaim["chatgpt_account_id"].(string); ok && accountID != "" {
+			return accountID
+		}
+	}
+
+	if orgs, ok := claims["organizations"].([]any); ok {
+		for _, org := range orgs {
+			if orgMap, ok := org.(map[string]any); ok {
+				if accountID, ok := orgMap["id"].(string); ok && accountID != "" {
+					return accountID
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func parseJWTClaims(token string) (map[string]any, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("token is not a JWT")
 	}
 
 	payload := parts[1]
@@ -383,21 +655,15 @@ func extractAccountID(accessToken string) string {
 
 	decoded, err := base64URLDecode(payload)
 	if err != nil {
-		return ""
+		return nil, err
 	}
 
-	var claims map[string]interface{}
+	var claims map[string]any
 	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return ""
+		return nil, err
 	}
 
-	if authClaim, ok := claims["https://api.openai.com/auth"].(map[string]interface{}); ok {
-		if accountID, ok := authClaim["chatgpt_account_id"].(string); ok {
-			return accountID
-		}
-	}
-
-	return ""
+	return claims, nil
 }
 
 func base64URLDecode(s string) ([]byte, error) {
@@ -405,7 +671,8 @@ func base64URLDecode(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
 }
 
-func openBrowser(url string) error {
+// OpenBrowser opens the given URL in the user's default browser.
+func OpenBrowser(url string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return exec.Command("open", url).Start()
